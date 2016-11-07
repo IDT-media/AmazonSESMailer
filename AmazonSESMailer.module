@@ -1,0 +1,670 @@
+<?php
+/**
+ * AmazonSESMailer
+ *
+ * Copyright:
+ *
+ * IDT Media - Goran Ilic & Tapio Löytty
+ * Web: www.i-do-this.com
+ * Email: hi@i-do-this.com
+ *
+ *
+ * Authors:
+ *
+ * Goran Ilic, <ja@ich-mach-das.at>
+ * Web: www.ich-mach-das.at
+ *
+ * Tapio Löytty, <tapsa@orange-media.fi>
+ * Web: www.orange-media.fi
+ *
+ *
+ * ProcessWire 2.x
+ * Copyright (C) 2014 by Ryan Cramer
+ * Licensed under GNU/GPL v2, see LICENSE.TXT
+ *
+ * http://processwire.com
+ *
+ */
+
+require 'vendor/autoload.php';
+use Aws\AwsClientInterface;
+use Aws\Ses\SesClient;
+use Aws\Ses\Exception\SesException;
+
+class AmazonSESMailer extends WireMail implements Module, ConfigurableModule
+{
+
+    #----------------------------
+    # Attributes
+    #----------------------------
+
+    static private $aws_key;
+    static private $aws_secret_key;
+    private        $SesClient;
+    private        $config = array();
+    private        $parameters = array();
+    public         $message = array();
+    public         $verifiedMail;
+
+    #----------------------------
+    # Magic Methods
+    #----------------------------
+
+    /**
+     * Populate the default config data
+     *
+     * ProcessWire will automatically overwrite it with anything the user has specifically configured.
+     * This is done in construct() rather than init() because ProcessWire populates config data after
+     * construct(), but before init().
+     *
+     */
+    public function __construct()
+    {
+        foreach (self::getDefaultConfig() as $key => $value) {
+            $this->$key = $value;
+        }
+    }
+
+    #----------------------------
+    # Interface Methods
+    #----------------------------
+
+    /**
+     * ___callSesServiceAction Uses magic method to create a command for AWS Method
+     * @param  string $method    Name of the operation to use in the command
+     * @param  array  $arguments Arguments to pass to the command
+     */
+    protected function ___callSesServiceAction($method, $arguments = array())
+    {
+        if (!$this->SesClient)
+            $object = $this->getSesObject();
+
+        try
+        {
+            if(is_object($object)) {
+
+                $callto = array($object, $method);
+
+                if(is_callable($callto))
+                    return call_user_func($callto, $arguments);
+
+            }
+        }
+        catch (SesException $e) {
+            throw new SesException($e->getMessage);
+        }
+    }
+
+    #----------------------------
+    # Interface Methods: Module
+    #----------------------------
+
+    /**
+     * getModuleInfo
+     * required by all modules to tell ProcessWire about them
+     *
+     * @return array
+     */
+    public static function getModuleInfo()
+    {
+
+        return array(
+            'title' => __('AWS SES Mailer'),
+            'author' => 'IDT Media',
+            'version' => '0.1',
+            'summary' => __('WireMail Module providing a Amazon AWS SES integration'),
+            'autoload' => true,
+            'requires' => array(
+                'ProcessWire>=2.7.0'
+            ),
+            'icon' => 'envelope-o'
+        );
+    }
+
+    /**
+     * getDefaultConfig
+     * Default configuration for this module
+     *
+     * The point of putting this in it's own function is so that you don't have to specify
+     * these defaults more than once.
+     *
+     * @return  array
+     */
+    public static function getDefaultConfig()
+    {
+
+        return array(
+            'aws_key' => '',
+            'aws_secret_key' => '',
+            'aws_ses_region' => '',
+            'defaultFromMail' => 'processwire@' . wire('config')->httpHost,
+            'defaultFromName' => 'ProcessWire'
+
+        );
+    }
+
+    /**
+     * getModuleConfigInputFields
+     * Module configuration fields for default backend module configuraiton
+     *
+     * @param  array  $data Module data from the database.
+     */
+    public static function getModuleConfigInputfields(array $data)
+    {
+
+        $wrapper = new InputfieldWrapper();
+        $modules = wire('modules');
+        $data    = array_merge(self::getDefaultConfig(), $data);
+        $_this   = wire('modules')->get('AmazonSESMailer');
+
+        if (!empty($_this->aws_key) && !empty($_this->aws_secret_key)) {
+            $_this->identities = $_this->listIdentities('EmailAddress');
+        }
+
+        if (wire()->input->post('verify-mail'))
+            $_this->verifyEmailIdentity($_this->defaultFromMail);
+
+        // Default From address
+        $f              = $modules->get('InputfieldText');
+        $f->name        = 'defaultFromMail';
+        $f->label       = __('Default E-Mail Address');
+        $f->description = __('Make sure that this E-Mail Address or Domain was verified in your AWS SES account.');
+        $f->required    = true;
+        if (isset($data[$f->name]))
+            $f->value = $data[$f->name];
+
+        if ($_this->defaultFromMail && $_this->identities) {
+            $verified = $_this->getIdentityVerificationAttributes(array(
+                $_this->defaultFromMail
+            ));
+            $status   = $verified[$_this->defaultFromMail]['VerificationStatus'] ? $verified[$_this->defaultFromMail]['VerificationStatus'] : __('Not found');
+
+            $f->notes = sprintf(__("The verification status of this email address is: %s"), $status);
+        }
+
+        $wrapper->append($f);
+
+        // verification button
+        if (!$verified && $_this->identities) {
+            $f              = $modules->get('InputfieldFieldset');
+            $f->label       = __('AWS SES Verification');
+            $f->description = __('Send a verification request to AWS SES for given email address.');
+
+            $btn        = $modules->get('InputfieldButton');
+            $btn->id    = 'verify-mail';
+            $btn->type  = 'submit';
+            $btn->value = __('Request Verification');
+            $btn->name  = 'verify-mail';
+
+            $f->add($btn);
+            $wrapper->append($f);
+        }
+
+        // Default From name
+        $f           = $modules->get('InputfieldText');
+        $f->name     = 'defaultFromName';
+        $f->label    = __('Default from Name');
+        $f->required = true;
+        if (isset($data[$f->name]))
+            $f->value = $data[$f->name];
+
+        $wrapper->append($f);
+
+        // ASW Settings
+        $fieldset        = $modules->get('InputfieldFieldset');
+        $fieldset->label = __('AWS SES Settings');
+
+        $wrapper->append($fieldset);
+
+        // AWS Key
+        $f              = $modules->get('InputfieldText');
+        $f->name        = 'aws_key';
+        $f->label       = __('AWS Key');
+        $f->description = __('Your Amazon AWS key.');
+        $f->notes       = __('You need an API key, which is available after signing up for [Amazon AWS](https://aws.amazon.com/de/). It is recommended that you create a new user in your AWS Console instead of using global AWS Key.');
+        $f->required    = 1;
+        $f->collapsed   = 5;
+        $f->value       = $data['aws_key'];
+
+        $fieldset->append($f);
+
+        // AWS secret key
+        $f              = $modules->get('InputfieldText');
+        $f->name        = 'aws_secret_key';
+        $f->label       = __('AWS Secret Key');
+        $f->description = __('Your Amazon AWS secret key.');
+        $f->notes       = __('You need an API key, which is available after signing up for [Amazon AWS](https://aws.amazon.com/de/). It is recommended that you create a new user in your AWS Console instead of using global AWS Key.');
+        $f->required    = 1;
+        $f->collapsed   = 5;
+        $f->value       = $data['aws_secret_key'];
+
+        $fieldset->append($f);
+
+        // Default Region
+        $f = $modules->get('InputfieldSelect');
+        $f->addOptions(array(
+            'us-east-1' => __('US East (N. Virginia)'),
+            'us-west-2' => __('US West (Oregon)'),
+            'eu-west-1' => __('EU (Ireland)')
+        ));
+        $f->name        = 'aws_ses_region';
+        $f->label       = __('AWS SES Region');
+        $f->description = __('Which Amazon SES Region should be used.');
+        $f->description = __('Select a corresponding Region which you have used to create and verify your E-Mail Address or Domain.');
+        $f->required    = 1;
+        $f->value       = $data['aws_ses_region'];
+
+        $fieldset->append($f);
+
+        return $wrapper;
+    }
+
+    /**
+     * init
+     * ProcessWire calls this when the module is loaded. For 'autoload' modules, this will be called
+     * when ProcessWire's API is ready. As a result, this is a good place to attach hooks.
+     */
+    public function init()
+    {
+
+    }
+
+    #----------------------------
+    # Class Methods
+    #----------------------------
+
+    /**
+     * bcc
+     * Set blind carbon copy recipients
+     * @param  array|string $email
+     * @return $this
+     */
+    public function bcc($email)
+    {
+
+        $this->bcc = is_array($email) ? $email : explode(',', $email);
+        return $this;
+
+    }
+
+    /**
+     * cc
+     * Set carbon copy recipients
+     * @param  array|string $email
+     * @return $this
+     */
+    public function cc($email)
+    {
+
+        $this->cc = is_array($email) ? $email : explode(',', $email);
+        return $this;
+
+    }
+
+    /**
+     * ___send
+     * Composes an email message based on input data, and then immediately queues the message for sending.
+     */
+    public function ___send()
+    {
+
+        $data = array();
+        // sender must be verified
+        $from = $this->verifiedMail ? $this->verifiedMail : $this->defaultFromMail;
+
+        // build required array for SES
+        $data['Source']                          = $from;
+        $data['ReplyToAddresses']                = array(
+            $this->from ? $this->from : $this->defaultFromMail
+        );
+        $data['Message']['Subject']['Data']      = $this->subject;
+        $data['Message']['Body']['Text']['Data'] = $this->body;
+        $data['Message']['Body']['Html']['Data'] = $this->bodyHTML;
+
+        // if we have to recipients
+        if ($this->to) {
+            // send as BCC if there is more than one recipient
+            if (count($this->to) > 1) {
+                foreach ($this->to as $to) {
+                    $data['Destination']['BccAddresses'][] = $to;
+                }
+            } else {
+                $data['Destination']['ToAddresses'] = $this->to;
+            }
+        }
+        // if we have carbon copy recipients
+        if ($this->cc)
+            $data['Destination']['CcAddresses'] = $this->cc;
+        // if we have blind carbon copy recipients, use this for bulk mails
+        if ($this->bcc)
+            $data['Destination']['BccAddresses'] = $this->bcc;
+
+        try {
+            // TODO, SES API can handle only 50 recipients at once,
+            // figure out how to split recipients in chunks and trigger sendEmail
+            // or should we simply foreach recipients and trigger sendEmail each time??
+            $result = $this->sendEmail($data);
+
+            if (isset($result) && preg_match("/Error/i", $result)) {
+                $this->log->save('amazon-ses-mailer-errors', get_class(self) . ': ' . $result, array(
+                    'showUser' => false
+                ));
+                $this->error(__('An error has occured: ') . $result);
+            }
+
+        }
+        catch (SesException $e) {
+            $this->log->save('amazon-ses-mailer-errors', get_class($e) . ': ' . $e->getMessage(), array(
+                'showUser' => false
+            ));
+            throw new WireException($e->getMessage());
+        }
+
+    }
+
+    /**
+     * ___sendRaw
+     * Sends an email message, with header and content specified by the client.
+     * The SendRawEmail action is useful for sending multipart MIME emails.
+     * The raw text of the message must comply with Internet email standards; otherwise, the message cannot be sent.
+     */
+    public function ___sendRaw()
+    {
+
+        $data     = array();
+        // sender has to be verified
+        $from     = $this->verifiedMail ? $this->verifiedMail : $this->defaultFromMail;
+        $replyTo  = $this->from ? $this->from : $this->defaultFromMail;
+        $header   = '';
+        $body     = '';
+        $text     = $this->body;
+        $html     = $this->bodyHTML;
+        $boundary = "==Multipart_Boundary_x" . md5(time()) . "x";
+
+        // build mime type message
+        $header = "From: $from\r\n";
+        $header .= "Reply-To: $replyTo\r\n";
+        $header .= "Date: " . date('D, j M Y H:i:s O') . "\r\n";
+        $header .= "Subject: $this->subject\r\n";
+
+        foreach ($this->header as $key => $value) {
+            $header .= "$key: $value\r\n";
+        }
+
+        $header = trim($header);
+
+        if ($this->bodyHTML) {
+            if (!strlen($text))
+                $text = strip_tags($html);
+            $header .= "\r\nMessage-ID: <" . substr(md5(date('r', time())), 0, 5) . '-' . substr(md5(date('r', time())), 0, 5) . "-" . substr(md5(date('r', time())), 0, 5) . "@processwire.com>" . "\r\n";
+            $header .= "Content-Type: multipart/alternative; boundary=\"$boundary\"\r\n";
+            $header .= "MIME-Version: 1.0\r\n\r\n";
+            $body = "--$boundary\r\n" . "Content-Type: text/plain; charset=\"utf-8\"\r\n" . "Content-Transfer-Encoding: 7bit\r\n\r\n\r\n" . "$text\r\n" . "--$boundary\r\n" . "Content-Type: text/html; charset=\"utf-8\"\r\n" . "Content-Transfer-Encoding: 7bit\r\n\r\n\r\n" . "$html\r\n" . "--$boundary--";
+        } else {
+            $header .= "\r\nContent-Type: text/plain; charset=\"utf-8\"";
+            $body = $text;
+        }
+
+        $message = $header . $body;
+
+        // build required array for SES
+        $data['Source']             = $from;
+        $data['Destinations']       = array_merge($this->to, $this->cc, $this->bcc);
+        $data['RawMessage']['Data'] = $message;
+
+        //TODO implement Attachments and SES sendRawEmail method
+    }
+
+    #---------------------
+    # Helper
+    #---------------------
+
+    /**
+     * getSesObject
+     * Creates connection to AWS SES with given credentials
+     *
+     * @return object SesClient Object
+     */
+    protected function getSesObject()
+    {
+        $this->config = array(
+            'credentials' => array(
+                'key' => $this->aws_key,
+                'secret' => $this->aws_secret_key
+            ),
+            'version' => 'latest',
+            'region' => $this->aws_ses_region
+        );
+
+        // connect to aws SES
+        $this->SesClient = new SesClient($this->config);
+
+        return $this->SesClient;
+    }
+
+    /**
+     * setParameter
+     * appends parameter to ses request by given key|value
+     *
+     * @param string  $key
+     * @param string  $value
+     * @param boolean $array treat value as array or string (default true)
+     * @param boolean $replace Whether to replace the key if it already exists (default true)
+     */
+    private function setParameter($key, $value, $array = true, $replace = true)
+    {
+
+        if (!$replace && isset($this->parameters[$key])) {
+
+            $temp                   = (array) ($this->parameters[$key]);
+            $temp[]                 = !$array ? $value : array(
+                $value
+            );
+            $this->parameters[$key] = $temp;
+
+        } else {
+
+            $this->parameters[$key] = !$array ? $value : array(
+                $value
+            );
+        }
+    }
+
+    #----------------------------
+    # SesClient Class Methods
+    #----------------------------
+
+    /**
+     * getIdentityVerificationAttributes
+     * Given a list of identities (email addresses and/or domains), returns the verification status and (for domain identities) the verification token for each identity.
+     * For detailed documentation see ({@link http://docs.aws.amazon.com/aws-sdk-php/v3/api/api-email-2010-12-01.html#getidentityverificationattributes})
+     *
+     * @param  array  $Identities A list of identities
+     * @return array              Associative array of custom strings keys (Identity) to IdentityVerificationAttributes structures
+     * @throws \Aws\Ses\Exception\SesException
+     */
+    public function getIdentityVerificationAttributes(array $Identities = array())
+    {
+
+        if (!$this->SesClient)
+            $this->getSesObject();
+
+        $this->setParameter('Identities', $Identities, false);
+
+        try {
+
+            $request = $this->SesClient->getIdentityVerificationAttributes($this->parameters);
+
+            if (!empty($request['VerificationAttributes'])) {
+                $response = $request['VerificationAttributes'];
+            } else {
+                $response = false;
+            }
+
+            return $response;
+        }
+        catch (SesException $e) {
+            throw new WireException($e->getMessage());
+        }
+    }
+
+    /**
+     * getSendQuota
+     * Returns the user's current sending limits.
+     * For edtailed documentation see ({@link http://docs.aws.amazon.com/aws-sdk-php/v3/api/api-email-2010-12-01.html#getsendquota})
+     *
+     * @return array Associative array of sending limits
+     * @throws \Aws\Ses\Exception\SesException
+     */
+    public function getSendQuota()
+    {
+
+        if (!$this->SesClient)
+            $this->getSesObject();
+
+        try {
+
+            $response = $this->SesClient->GetSendQuota();
+
+            return $response;
+        }
+        catch (SesException $e) {
+            throw new WireException($e->getMessage());
+        }
+
+    }
+
+    /**
+     * getSendStatistics
+     * Returns the user's sending statistics. The result is a list of data points, representing the last two weeks of sending activity.
+     * For detailed documentation see ({@link http://docs.aws.amazon.com/aws-sdk-php/v3/api/api-email-2010-12-01.html#getsendstatistics})
+     *
+     * @return array     A list of data points, each of which represents 15 minutes of activity.
+     * @throws \Aws\Ses\Exception\SesException
+     */
+    public function getSendStatistics()
+    {
+
+        if (!$this->SesClient)
+            $this->getSesObject();
+
+        try {
+
+            $response = $this->SesClient->getSendStatistics();
+
+            return $response['SendDataPoints'];
+        }
+        catch (SesException $e) {
+            throw new WireException($e->getMessage());
+        }
+    }
+
+    /**
+     * listIdentities
+     * Returns a list containing all of the identities (email addresses and domains) for your AWS account, regardless of verification status.
+     * For detailed documentation see ({@link http://docs.aws.amazon.com/aws-sdk-php/v3/api/api-email-2010-12-01.html#listidentities})
+     * @param  string $Identity  Type The type of the identities to list. Possible values are "EmailAddress" and "Domain". If this parameter is omitted, then all identities will be listed.
+     * @param  int $MaxItems     The maximum number of identities per page. Possible values are 1-1000 inclusive.
+     * @param  string $NextToken The token to use for pagination.
+     * @return array]            Return associative array
+     */
+    public function listIdentities($IdentityType, $MaxItems, $NextToken)
+    {
+
+        if (!$this->SesClient)
+            $this->getSesObject();
+
+        if (!empty($IdentityType))
+            $this->setParameter('IdentityType', $IdentityType, false);
+        if (!empty($MaxItems))
+            $this->setParameter('MaxItems', (int) $MaxItems, false);
+        if (!empty($NextToken))
+            $this->setParameter('NextToken', $NextToken, false);
+
+        try {
+
+            $response = $this->SesClient->listIdentities($this->parameters);
+
+            return $response['Identities'];
+        }
+        catch (SesException $e) {
+            $this->error(__('Could not find any identity. Given AWS Key or AWS Secret Key is possibly incorrect or connection can not be established.'));
+            return false;
+        }
+    }
+
+    /**
+     * sendEmail
+     * Composes an email message based on input data, and then immediately queues the message for sending.
+     * For detailed documentation see ({@link http://docs.aws.amazon.com/aws-sdk-php/v3/api/api-email-2010-12-01.html#sendemail})
+     * @param  array  $params An associative array of message data
+     * @throws \Aws\Ses\Exception\SesException
+     */
+    public function sendEmail(array $params = array())
+    {
+
+        if (!$this->SesClient)
+            $this->getSesObject();
+
+        try {
+
+            $response = $this->SesClient->sendEmail($params);
+
+            return $response['MessageId'];
+        }
+        catch (SesException $e) {
+            throw new WireException($e->getMessage());
+        }
+    }
+
+    /**
+     * sendRawEmail
+     * Sends an email message, with header and content specified by the client. The SendRawEmail action is useful for sending multipart MIME emails. The raw text of the message must comply with Internet email standards; otherwise, the message cannot be sent.
+     * For detailed documentation see ({@link http://docs.aws.amazon.com/aws-sdk-php/v3/api/api-email-2010-12-01.html#sendrawemail})
+     * @param  array  $params An associative array of message data
+     * @throws \Aws\Ses\Exception\SesException
+     */
+    public function sendRawEmail(array $params = array())
+    {
+
+        if (!$this->SesClient)
+            $this->getSesObject();
+
+        try {
+
+            $response = $this->SesClient->sendRawEmail($params);
+
+            return $response['MessageId'];
+        }
+        catch (SesException $e) {
+            throw new WireException($e->getMessage());
+        }
+    }
+
+    /**
+     * verifyEmailIdentity
+     * Verifies an email address. This action causes a confirmation email message to be sent to the specified address.
+     * @param  string $EmailAddress The email address to be verified.
+     * @return string               Returns a Wire::message
+     * @throws \Aws\Ses\Exception\SesException
+     */
+    public function verifyEmailIdentity($EmailAddress)
+    {
+
+        if (!$this->SesClient)
+            $this->getSesObject();
+
+        $this->setParameter('EmailAddress', $EmailAddress, false);
+
+        try {
+
+            $this->SesClient->verifyEmailIdentity($this->parameters);
+            return $this->message(__('Your verification request was succesfully sent to AWS SES, you should recieve an email containing verification link shortly.'));
+        }
+        catch (SesException $e) {
+            throw new WireException($e->getMessage());
+        }
+
+    }
+
+}
